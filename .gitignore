@@ -1,0 +1,68 @@
+# ─── Secrets & Environment ────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ai-worker secrets (the real .env lives here)
+ai-worker/.env
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Go ───────────────────────────────────────────────────────────────────────
+# Compiled binaries
+*/main
+**/main.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test output
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work.sum
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+# Never commit override files with local secrets
+docker-compose.override.yml
+docker-compose.local.yml
+
+# ─── Scratch/utility scripts (dev-only, no need in repo) ──────────────────────
+fix_*.py
+fixer.py
+check_github.py
+push_repo.py
+init_repo.py
+
+# ─── Misc dev artifacts ───────────────────────────────────────────────────────
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ─── IDEs ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Git clone of dummy repo (used by ai-worker locally) ──────────────────────
+ai-worker/dummy_repo/

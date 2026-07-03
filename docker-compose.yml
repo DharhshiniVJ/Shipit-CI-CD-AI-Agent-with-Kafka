@@ -1,0 +1,106 @@
+services:
+  # ── Kafka (KRaft mode, no Zookeeper) ──────────────────────────────────────
+  kafka:
+    image: apache/kafka:latest
+    container_name: shipit-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine   # alpine = small, fast image (~80MB)
+    container_name: shipit-postgres
+    ports:
+      - "5432:5432"             # default Postgres port
+    environment:
+      POSTGRES_USER: shipit
+      POSTGRES_PASSWORD: shipit
+      POSTGRES_DB: pipeline_db
+    # Named volume: data persists even if the container is stopped/removed.
+    # Without this, every `docker-compose down` would wipe the database.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # ── Go Microservices ───────────────────────────────────────────────────────
+  pipeline-service:
+    build:
+      context: ./pipeline-service
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - DB_HOST=postgres
+      - DB_USER=shipit
+      - DB_PASSWORD=shipit
+      - DB_NAME=pipeline_db
+    restart: on-failure
+
+  build-service:
+    build:
+      context: ./build-service
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - DB_HOST=postgres
+      - DB_USER=shipit
+      - DB_PASSWORD=shipit
+      - DB_NAME=pipeline_db
+    restart: on-failure
+
+  deploy-service:
+    build:
+      context: ./deploy-service
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - DB_HOST=postgres
+      - DB_USER=shipit
+      - DB_PASSWORD=shipit
+      - DB_NAME=pipeline_db
+    restart: on-failure
+
+  notify-service:
+    build:
+      context: ./notify-service
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BROKER=kafka:29092
+    restart: on-failure
+
+  # ── AI Worker (Python) ─────────────────────────────────────────────────────
+  ai-worker:
+    build:
+      context: ./ai-worker
+    depends_on:
+      - kafka
+    env_file:
+      - ./ai-worker/.env
+    environment:
+      - KAFKA_BROKER=kafka:29092
+    restart: on-failure
+
+# Declare the named volume at the top level so Docker manages it.
+volumes:
+  postgres_data:
