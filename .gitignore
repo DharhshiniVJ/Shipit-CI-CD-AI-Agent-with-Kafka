@@ -4,9 +4,6 @@
 .env.*.local
 *.env
 
-# ai-worker secrets (the real .env lives here)
-ai-worker/.env
-
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -24,37 +21,29 @@ build/
 .ruff_cache/
 
 # ─── Go ───────────────────────────────────────────────────────────────────────
-# Compiled binaries
 */main
 **/main.exe
 *.exe
 *.dll
 *.so
 *.dylib
-
-# Test output
 *.test
 *.out
 coverage.txt
-
-# Go workspace
 go.work.sum
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
-# Never commit override files with local secrets
 docker-compose.override.yml
 docker-compose.local.yml
 
-# ─── Scratch/utility scripts (dev-only, no need in repo) ──────────────────────
-fix_*.py
-fixer.py
-check_github.py
-push_repo.py
-init_repo.py
+# ─── AI worker local clones ───────────────────────────────────────────────────
+ai-worker/dummy_repo/
 
-# ─── Misc dev artifacts ───────────────────────────────────────────────────────
+# ─── Logs & temp ──────────────────────────────────────────────────────────────
 *.log
 *.tmp
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
@@ -63,6 +52,3 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
-
-# ─── Git clone of dummy repo (used by ai-worker locally) ──────────────────────
-ai-worker/dummy_repo/
