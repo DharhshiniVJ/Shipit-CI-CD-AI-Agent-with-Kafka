@@ -79,9 +79,12 @@ func main() {
 		consumeDeployResults()
 	}()
 
-	log.Println("ðŸ‘‚ Listening on topics: build.completed + deploy.completed")
+	log.Println("👂 Listening on topics: build.completed + deploy.completed")
 
-	// Block until both goroutines finish (they never will â€” they loop forever)
+	// Start Prometheus metrics server in background
+	go startMetricsServer()
+
+	// Block until both goroutines finish (they never will — they loop forever)
 	wg.Wait()
 }
 
@@ -117,6 +120,7 @@ func consumeBuildResults() {
 		// Only send a notification for failed builds.
 		// Successful builds will be notified via deploy.completed.
 		if result.Status == "failed" {
+			metricNotificationsSent.WithLabelValues("build_failed").Inc()
 			sendNotification(
 				"build_failed",
 				result.ID,
