@@ -23,7 +23,8 @@ func logsCmd() *cobra.Command {
 			id := args[0]
 
 			fmt.Printf("👀 Watching pipeline %s...\n", id)
-			fmt.Println("   (polls every 2 seconds — Ctrl+C to exit early)\n")
+			fmt.Println("   (polls every 2 seconds — Ctrl+C to exit early)")
+
 
 			lastStatus := "" // track the previous status so we only print changes
 
