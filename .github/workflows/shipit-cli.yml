@@ -1,0 +1,43 @@
+name: shipit-cli CI
+
+on:
+  push:
+    paths:
+      - "shipit-cli/**"
+      - ".github/workflows/shipit-cli.yml"
+  pull_request:
+    paths:
+      - "shipit-cli/**"
+
+jobs:
+  ci:
+    name: Lint, Vet & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shipit-cli
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: shipit-cli/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: go vet (static analysis)
+        run: go vet ./...
+
+      - name: Build binary
+        run: go build -o /dev/null ./...
+
+      # Verify the CLI binary runs and shows help without error
+      - name: Smoke test CLI help
+        run: |
+          go build -o shipit .
+          ./shipit --help

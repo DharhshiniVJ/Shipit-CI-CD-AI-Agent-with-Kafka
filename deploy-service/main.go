@@ -25,6 +25,12 @@ type BuildResult struct {
 	Status string `json:"status"` // "success" or "failed"
 }
 
+// ApprovalEvent is the message we CONSUME from "approval.granted".
+type ApprovalEvent struct {
+	PipelineID string `json:"pipeline_id"`
+	ApprovedBy string `json:"approved_by"`
+}
+
 // DeploymentResult is the message we PRODUCE to "deploy.completed".
 // notify-service will consume this to send the final notification.
 type DeploymentResult struct {
@@ -44,6 +50,7 @@ var kafkaBroker = getEnv("KAFKA_BROKER", "localhost:9092")
 const (
 	topicBuildCompleted  = "build.completed"   // We CONSUME from this
 	topicDeployCompleted = "deploy.completed"  // We PRODUCE to this
+	topicApprovalGranted = "approval.granted"  // We CONSUME from this
 )
 
 // --------------------------------------------------------------------------------
@@ -85,6 +92,7 @@ func initDB() {
 
 	if _, err := db.Exec(createTable); err != nil {
 		log.Fatalf("âŒ Failed to create deployments table: %v", err)
+		log.Fatalf("â Œ Failed to create deployments table: %v", err)
 	}
 	log.Println("âœ… Table `deployments` ready")
 }
@@ -94,26 +102,12 @@ func initDB() {
 // --------------------------------------------------------------------------------
 
 func main() {
-	fmt.Println("ðŸš€ Starting deploy-service...")
+	fmt.Println("🚀 Starting deploy-service...")
 
 	initDB()
 	defer db.Close()
 
-	// Kafka consumer â€” reads build results
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{kafkaBroker},
-		Topic:   topicBuildCompleted,
-		// Each service that consumes "build.completed" needs its OWN unique GroupID.
-		// Kafka uses GroupID to track which messages each consumer has already read.
-		// If deploy-service and pipeline-service shared a GroupID, they'd split
-		// messages between them â€” each message would only go to ONE of them!
-		// With different GroupIDs, BOTH services get EVERY message independently.
-		GroupID: "deploy-service-group",
-		StartOffset: kafka.FirstOffset,
-	})
-	defer reader.Close()
-
-	// Kafka producer â€” publishes deployment results
+	// Kafka producer — publishes deployment results
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaBroker),
 		Topic:    topicDeployCompleted,
@@ -121,31 +115,43 @@ func main() {
 	}
 	defer writer.Close()
 
-	log.Printf("ðŸ‘‚ Listening on Kafka topic '%s'...\n", topicBuildCompleted)
+	go consumeBuildResults(writer)
+	go consumeApprovals(writer)
 
-	// Main event loop
+	// Block forever
+	select {}
+}
+
+func consumeBuildResults(writer *kafka.Writer) {
+	// Kafka consumer — reads build results
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{kafkaBroker},
+		Topic:   topicBuildCompleted,
+		GroupID: "deploy-service-group",
+		StartOffset: kafka.FirstOffset,
+	})
+	defer reader.Close()
+
+	log.Printf("👂 Listening on Kafka topic '%s'...\n", topicBuildCompleted)
+
 	for {
 		msg, err := reader.ReadMessage(context.Background())
 		if err != nil {
-			log.Printf("âŒ Error reading from Kafka: %v\n", err)
+			log.Printf("❌ Error reading from Kafka: %v\n", err)
 			continue
 		}
 
 		var result BuildResult
 		if err := json.Unmarshal(msg.Value, &result); err != nil {
-			log.Printf("âŒ Failed to parse build result: %v\n", err)
+			log.Printf("❌ Failed to parse build result: %v\n", err)
 			continue
 		}
 
-		log.Printf("ðŸ“¥ Received build result | pipeline: %s | status: %s\n",
+		log.Printf("📥 Received build result | pipeline: %s | status: %s\n",
 			result.ID, result.Status)
 
-		// -------------------------------------------------------------------------------- Conditional Logic â€” only deploy successful builds --------------------------------------------------------------------------------
-		// This is a key pattern in event-driven systems: consumers FILTER events.
-		// deploy-service doesn't blindly process every event â€” it checks the
-		// status and decides whether to act.
 		if result.Status != "success" {
-			log.Printf("â­ï¸  Skipping deployment for pipeline %s (build %s)\n",
+			log.Printf("⏭️  Skipping deployment for pipeline %s (build %s)\n",
 				result.ID, result.Status)
 
 			// Still publish a "skipped" event so notify-service knows what happened
@@ -153,14 +159,45 @@ func main() {
 				PipelineID: result.ID,
 				DeployID:   generateUUID(),
 				Status:     "skipped",
-				Reason:     fmt.Sprintf("Build %s â€” deployment skipped", result.Status),
+				Reason:     fmt.Sprintf("Build %s — deployment skipped", result.Status),
 				DeployedAt: time.Now(),
 			})
 			continue
 		}
 
-		// Build succeeded â€” run the deployment
-		deployResult := runDeployment(result.ID)
+		// Build succeeded — wait for QA approval!
+		log.Printf("⏸️  Build %s succeeded. Waiting for QA approval before deployment.\n", result.ID)
+	}
+}
+
+func consumeApprovals(writer *kafka.Writer) {
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{kafkaBroker},
+		Topic:   topicApprovalGranted,
+		GroupID: "deploy-service-approval-group",
+		StartOffset: kafka.FirstOffset,
+	})
+	defer reader.Close()
+
+	log.Printf("👂 Listening on Kafka topic '%s'...\n", topicApprovalGranted)
+
+	for {
+		msg, err := reader.ReadMessage(context.Background())
+		if err != nil {
+			log.Printf("❌ Error reading from Kafka: %v\n", err)
+			continue
+		}
+
+		var event ApprovalEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			log.Printf("❌ Failed to parse approval event: %v\n", err)
+			continue
+		}
+
+		log.Printf("✅ Received QA approval for pipeline: %s (by %s)\n", event.PipelineID, event.ApprovedBy)
+
+		// Build succeeded and approved — run the deployment
+		deployResult := runDeployment(event.PipelineID)
 
 		// Save deployment record to PostgreSQL
 		_, err = db.Exec(
@@ -173,7 +210,7 @@ func main() {
 			deployResult.DeployedAt,
 		)
 		if err != nil {
-			log.Printf("âŒ Failed to save deployment record: %v\n", err)
+			log.Printf("❌ Failed to save deployment record: %v\n", err)
 		}
 
 		// Publish the deployment result to Kafka for notify-service

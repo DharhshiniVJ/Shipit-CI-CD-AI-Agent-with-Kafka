@@ -1,0 +1,58 @@
+name: ai-worker CI
+
+on:
+  push:
+    paths:
+      - "ai-worker/**"
+      - ".github/workflows/ai-worker.yml"
+  pull_request:
+    paths:
+      - "ai-worker/**"
+
+jobs:
+  ci:
+    name: Lint & Syntax Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-worker
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+          pip install -r requirements.txt
+
+      # ruff is a very fast Python linter (replaces flake8 + isort + pyupgrade)
+      - name: Lint with ruff
+        run: ruff check .
+
+      # Verify all Python files are valid syntax (no import errors)
+      - name: Check syntax of all modules
+        run: |
+          python -c "import ast, os, sys
+          errors = []
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in ('venv', '__pycache__', '.git', 'dummy_repo')]
+              for f in files:
+                  if f.endswith('.py'):
+                      path = os.path.join(root, f)
+                      try:
+                          ast.parse(open(path).read())
+                      except SyntaxError as e:
+                          errors.append(f'{path}: {e}')
+          if errors:
+              print('Syntax errors found:')
+              for e in errors: print(e)
+              sys.exit(1)
+          print('All Python files OK')
+          "

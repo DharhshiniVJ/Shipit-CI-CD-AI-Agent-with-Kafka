@@ -53,6 +53,20 @@ type BuildResult struct {
 	Status string `json:"status"`
 }
 
+// Approval represents an approval record in the database.
+type Approval struct {
+	PipelineID string    `json:"pipeline_id"`
+	Status     string    `json:"status"`
+	ApprovedBy string    `json:"approved_by"`
+	ApprovedAt time.Time `json:"approved_at"`
+}
+
+// ApprovalEvent is the Kafka message we publish to "approval.granted".
+type ApprovalEvent struct {
+	PipelineID string `json:"pipeline_id"`
+	ApprovedBy string `json:"approved_by"`
+}
+
 // --------------------------------------------------------------------------------
 //  DATABASE
 // --------------------------------------------------------------------------------
@@ -105,10 +119,22 @@ func initDB() {
 
 	// Exec runs a SQL statement that doesn't return rows (CREATE, INSERT, UPDATE, DELETE).
 	if _, err := db.Exec(createTable); err != nil {
-		log.Fatalf("âŒ Failed to create table: %v", err)
+		log.Fatalf("❌ Failed to create table: %v", err)
 	}
 
-	log.Println("âœ… Table `pipeline_runs` ready")
+	createApprovalsTable := `
+	CREATE TABLE IF NOT EXISTS approvals (
+		pipeline_id TEXT PRIMARY KEY,
+		status      TEXT NOT NULL DEFAULT 'pending',
+		approved_by TEXT,
+		approved_at TIMESTAMPTZ
+	)`
+
+	if _, err := db.Exec(createApprovalsTable); err != nil {
+		log.Fatalf("❌ Failed to create approvals table: %v", err)
+	}
+
+	log.Println("✅ Tables `pipeline_runs` and `approvals` ready")
 }
 
 // --------------------------------------------------------------------------------
@@ -121,9 +147,11 @@ const (
 	topicTriggered       = "pipeline.triggered"
 	topicBuildCompleted  = "build.completed"
 	topicDeployCompleted = "deploy.completed"
+	topicApprovalGranted = "approval.granted"
 )
 
 var kafkaWriter *kafka.Writer
+var kafkaApprovalWriter *kafka.Writer
 
 // --------------------------------------------------------------------------------
 //  MAIN
@@ -142,14 +170,23 @@ func main() {
 	}
 	defer kafkaWriter.Close()
 
+	kafkaApprovalWriter = &kafka.Writer{
+		Addr:     kafka.TCP(kafkaBroker),
+		Topic:    topicApprovalGranted,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer kafkaApprovalWriter.Close()
+
 	// Step 3: Start the Kafka consumer in the background.
 	go consumeBuildResults()
 
 	// Step 4: Register HTTP routes and start the server.
 	http.HandleFunc("/trigger", triggerHandler)
 	http.HandleFunc("/status/", statusHandler)
+	http.HandleFunc("/approve/", approveHandler)
+	http.HandleFunc("/approvals", listApprovalsHandler)
 
-	fmt.Println("ðŸš€ Starting pipeline-service on http://localhost:8080...")
+	fmt.Println("🚀 Starting pipeline-service on http://localhost:8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -180,7 +217,7 @@ func triggerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// -------------------------------------------------------------------------------- INSERT into PostgreSQL --------------------------------------------------------------------------------
-	// $1, $2, $3... are positional placeholders â€” PostgreSQL's way of safely
+	// $1, $2, $3... are positional placeholders — PostgreSQL's way of safely
 	// injecting values. This prevents SQL injection attacks.
 	// Never use fmt.Sprintf to build SQL strings!
 	insertSQL := `
@@ -189,19 +226,19 @@ func triggerHandler(w http.ResponseWriter, r *http.Request) {
 
 	_, err := db.Exec(insertSQL, run.ID, run.Repo, run.Commit, run.Status, run.CreatedAt)
 	if err != nil {
-		log.Printf("âŒ Failed to insert pipeline run: %v\n", err)
+		log.Printf("❌ Failed to insert pipeline run: %v\n", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	// --------------------------------------------------------------------------------
 
-	log.Printf("â–¶ï¸  Pipeline %s triggered | repo: %s | commit: %s\n", run.ID, run.Repo, run.Commit)
+	log.Printf("▶️   Pipeline %s triggered | repo: %s | commit: %s\n", run.ID, run.Repo, run.Commit)
 
 	// -------------------------------------------------------------------------------- Publish to Kafka --------------------------------------------------------------------------------
 	event := BuildEvent{ID: run.ID, Repo: run.Repo, Commit: run.Commit}
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
-		log.Printf("âŒ Failed to marshal Kafka event: %v\n", err)
+		log.Printf("❌ Failed to marshal Kafka event: %v\n", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -211,9 +248,9 @@ func triggerHandler(w http.ResponseWriter, r *http.Request) {
 		Value: eventBytes,
 	})
 	if err != nil {
-		log.Printf("âŒ Failed to publish to Kafka: %v\n", err)
+		log.Printf("❌ Failed to publish to Kafka: %v\n", err)
 	} else {
-		log.Printf("ðŸ“¨ Published event to Kafka topic '%s'\n", topicTriggered)
+		log.Printf("📧 Published event to Kafka topic '%s'\n", topicTriggered)
 	}
 	// --------------------------------------------------------------------------------
 
@@ -258,13 +295,92 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		log.Printf("âŒ Database query error: %v\n", err)
+		log.Printf("❌ Database query error: %v\n", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(run)
+}
+
+// approveHandler handles POST /approve/{id}.
+// Marks a pipeline as approved and publishes an approval event.
+func approveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/approve/")
+	if id == "" {
+		http.Error(w, "Missing pipeline ID", http.StatusBadRequest)
+		return
+	}
+
+	updateSQL := `
+		UPDATE approvals 
+		SET status = 'approved', approved_by = 'qa-team', approved_at = $1 
+		WHERE pipeline_id = $2 AND status = 'pending'
+		RETURNING pipeline_id`
+	
+	var returnedID string
+	err := db.QueryRow(updateSQL, time.Now(), id).Scan(&returnedID)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Pipeline not found or not pending approval", http.StatusNotFound)
+		return
+	} else if err != nil {
+		log.Printf("❌ Failed to update approval: %v\n", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Publish to Kafka
+	event := ApprovalEvent{PipelineID: id, ApprovedBy: "qa-team"}
+	eventBytes, _ := json.Marshal(event)
+	
+	err = kafkaApprovalWriter.WriteMessages(context.Background(), kafka.Message{
+		Key:   []byte(id),
+		Value: eventBytes,
+	})
+	if err != nil {
+		log.Printf("❌ Failed to publish approval to Kafka: %v\n", err)
+	} else {
+		log.Printf("📫 Published approval for pipeline %s to Kafka\n", id)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"message": "Pipeline %s approved"}`, id)
+}
+
+// listApprovalsHandler handles GET /approvals
+func listApprovalsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	selectSQL := `SELECT pipeline_id, status, COALESCE(approved_by, ''), COALESCE(approved_at, '1970-01-01T00:00:00Z'::timestamptz) FROM approvals WHERE status = 'pending'`
+	rows, err := db.Query(selectSQL)
+	if err != nil {
+		log.Printf("❌ Failed to query approvals: %v\n", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	approvals := []Approval{}
+	for rows.Next() {
+		var a Approval
+		if err := rows.Scan(&a.PipelineID, &a.Status, &a.ApprovedBy, &a.ApprovedAt); err != nil {
+			log.Printf("❌ Failed to scan approval: %v\n", err)
+			continue
+		}
+		approvals = append(approvals, a)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(approvals)
 }
 
 // --------------------------------------------------------------------------------
@@ -282,45 +398,56 @@ func consumeBuildResults() {
 	})
 	defer reader.Close()
 
-	log.Printf("ðŸ‘‚ Listening on Kafka topic '%s'...\n", topicBuildCompleted)
+	log.Printf("👂 Listening on Kafka topic '%s'...\n", topicBuildCompleted)
 
 	for {
 		msg, err := reader.ReadMessage(context.Background())
 		if err != nil {
-			log.Printf("âŒ Error reading from Kafka: %v\n", err)
+			log.Printf("❌ Error reading from Kafka: %v\n", err)
 			continue
 		}
 
 		var result BuildResult
 		if err := json.Unmarshal(msg.Value, &result); err != nil {
-			log.Printf("âŒ Failed to parse build result: %v\n", err)
+			log.Printf("❌ Failed to parse build result: %v\n", err)
 			continue
 		}
 
 		// -------------------------------------------------------------------------------- UPDATE in PostgreSQL --------------------------------------------------------------------------------
-		// This is durable â€” even if the service restarts after this line,
+		// This is durable — even if the service restarts after this line,
 		// the status is safely stored on disk in Postgres.
 		updateSQL := `UPDATE pipeline_runs SET status = $1 WHERE id = $2`
 		res, err := db.Exec(updateSQL, result.Status, result.ID)
 		if err != nil {
-			log.Printf("âŒ Failed to update pipeline status: %v\n", err)
+			log.Printf("❌ Failed to update pipeline status: %v\n", err)
 			continue
 		}
 
 		// RowsAffected tells us how many rows were changed.
-		// 0 means the ID wasn't found â€” something is wrong.
+		// 0 means the ID wasn't found — something is wrong.
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			log.Printf("âš ï¸  No pipeline found with ID %s to update\n", result.ID)
+			log.Printf("⚠️   No pipeline found with ID %s to update\n", result.ID)
 			continue
 		}
 		// --------------------------------------------------------------------------------
 
-		icon := "âœ…"
+		icon := "✅"
 		if result.Status == "failed" {
-			icon = "âŒ"
+			icon = "❌"
 		}
 		log.Printf("%s Pipeline %s updated to status: %s\n", icon, result.ID, result.Status)
+
+		// If success, insert into approvals table so it can be approved
+		if result.Status == "success" {
+			insertApprovalSQL := `INSERT INTO approvals (pipeline_id, status) VALUES ($1, 'pending') ON CONFLICT DO NOTHING`
+			_, err = db.Exec(insertApprovalSQL, result.ID)
+			if err != nil {
+				log.Printf("❌ Failed to insert into approvals: %v\n", err)
+			} else {
+				log.Printf("⏸️  Pipeline %s is awaiting deployment approval\n", result.ID)
+			}
+		}
 	}
 }
 

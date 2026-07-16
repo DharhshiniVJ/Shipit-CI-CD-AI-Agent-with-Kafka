@@ -49,6 +49,8 @@ Trigger pipelines, check status, and watch builds in real time.`,
 	rootCmd.AddCommand(triggerCmd())
 	rootCmd.AddCommand(statusCmd())
 	rootCmd.AddCommand(logsCmd())
+	rootCmd.AddCommand(approveCmd())
+	rootCmd.AddCommand(approvalsCmd())
 
 	// Execute parses os.Args and runs the appropriate command.
 	// If it fails (e.g., unknown flag), cobra prints the error and usage automatically.
