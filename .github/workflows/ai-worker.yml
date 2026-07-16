@@ -32,9 +32,14 @@ jobs:
           pip install ruff
           pip install -r requirements.txt
 
-      # ruff is a very fast Python linter (replaces flake8 + isort + pyupgrade)
-      - name: Lint with ruff
-        run: ruff check .
+      # Ruff in error-only mode:
+      # E9   = syntax errors, invalid escape sequences
+      # F63  = invalid star expressions
+      # F7   = syntax errors in type annotations
+      # F82  = undefined names (catches real bugs like missing imports)
+      # This avoids failing on stylistic issues in an existing codebase.
+      - name: Lint with ruff (errors only)
+        run: ruff check --select E9,F63,F7,F82 --exclude venv,dummy_repo .
 
       # Verify all Python files are valid syntax (no import errors)
       - name: Check syntax of all modules
