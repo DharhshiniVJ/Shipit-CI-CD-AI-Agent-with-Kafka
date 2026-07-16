@@ -2,6 +2,8 @@ name: Integration Test
 
 # Runs the full stack (docker compose) and fires a real pipeline trigger.
 # Proves all 5 services start, connect to Kafka/Postgres, and process a request end-to-end.
+# NOTE: Each Go service has its own go.mod (separate modules), so we must
+# cd into the service directory before running go build/test commands.
 on:
   push:
     branches: [main]
@@ -71,9 +73,13 @@ jobs:
           fi
           echo "pipeline-service is accepting requests."
 
-      # Build the CLI from source and fire a real trigger
+      # Each Go service is its own module (separate go.mod).
+      # We must cd into shipit-cli before building.
       - name: Build shipit CLI
-        run: go build -o shipit ./shipit-cli/...
+        run: |
+          cd shipit-cli
+          go build -o ../shipit .
+
 
       - name: Trigger a pipeline
         run: |
