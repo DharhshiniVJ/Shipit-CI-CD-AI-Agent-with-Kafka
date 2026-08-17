@@ -223,6 +223,9 @@ Furthermore, the deployment pipeline includes a **QA Approval Gate**:
 - [x] GitHub Actions — lint, test, build/push Docker images
 - [x] Prometheus + Grafana — metrics and dashboards
 - [x] Kubernetes — K8s manifests for all services
+- [ ] Critic-gated PR publishing — stage AI fixes, run compiler/tests and Critic review, then open the GitHub PR only after acceptance
+- [ ] Full GitOps reconciliation — commit generated manifests to a GitOps repository and reconcile them with Argo CD or Flux
+- [ ] Production workflow reliability — add idempotency, retry policies, dead-letter topics, and an outbox pattern for Kafka/DB consistency
 - [ ] OpenTelemetry — distributed tracing across the full pipeline
 
 ---
