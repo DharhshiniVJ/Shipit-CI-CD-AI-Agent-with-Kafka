@@ -4,37 +4,102 @@ main.py — AI Worker Service entry point
 This is the Kafka consumer that listens for failed builds and kicks off
 the LangGraph multi-agent pipeline to diagnose and fix the failure.
 
-Flow:
+It ALSO runs an HTTP server on port 8000 with one endpoint:
+  POST /analyze-build  ← called by build-service before running a build
+                          to let the AI determine the correct build command
+
+Flow (failure diagnosis):
   1. Consume messages from "build.completed" topic
   2. Filter for status == "failed"
   3. Extract the build log from the message
   4. Run the LangGraph graph (Inspector → Analyst → Fixer → Critic)
   5. Log the PR URL if a fix was opened
 
+Flow (build planning):
+  1. build-service clones a repo
+  2. build-service POSTs the file tree + key file contents to /analyze-build
+  3. This service calls the LLM to determine the build command
+  4. Returns {language, build_command, test_command, runtime_image}
+
 This service is written in Python (not Go) because LangGraph, LangChain,
 and Pydantic are Python-native. The Go services communicate with this
-service only through Kafka — they never call each other directly.
+service only through Kafka or direct HTTP — they never share code.
 """
 
 import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from dotenv import load_dotenv
 from kafka import KafkaConsumer
+from prometheus_client import Counter, start_http_server
 
 # Load environment variables from .env file
 # This must happen BEFORE importing graph.py, since agents read env vars at import time
 load_dotenv()
 
-from graph import agent_graph  # noqa: E402 — imported after load_dotenv intentionally
+from graph import agent_graph          # noqa: E402
+from build_planner import analyze_repo  # noqa: E402
+
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 TOPIC = "build.completed"
 GROUP_ID = "ai-worker-group"
 
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+# Counter: total AI agent runs, labeled by outcome.
+# outcome = "pr_opened" | "no_pr" | "error"
+AI_RUNS = Counter(
+    "shipit_ai_runs_total",
+    "Total AI agent pipeline runs, labeled by outcome",
+    ["outcome"],
+)
+
+
+
+# ── HTTP Server for Build Planning ────────────────────────────────────────────
+
+class BuildPlannerHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/analyze-build":
+            self.send_response(404)
+            self.end_headers()
+            return
+            
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        
+        try:
+            req = json.loads(body)
+            file_tree = req.get("file_tree", [])
+            file_contents = req.get("file_contents", {})
+            
+            print(f"🧠 AI Build Planner analyzing repo ({len(file_tree)} files)...")
+            result = analyze_repo(file_tree, file_contents)
+            print(f"   Detected: {result.get('language')} | {result.get('build_command')} | Confidence: {result.get('confidence')}")
+            
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+        except Exception as e:
+            print(f"❌ AI Build Planner error: {e}")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+
+def start_planner_server():
+    server = HTTPServer(("0.0.0.0", 8000), BuildPlannerHandler)
+    print("🤖 Build Planner API listening on :8000")
+    server.serve_forever()
+
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def main():
     print("🤖 Starting ai-worker service...")
-    print(f"   Model:  Cerebras llama-3.3-70b")
+    print("   Model:  Cerebras gpt-oss-120b")
     print(f"   Kafka:  {KAFKA_BROKER}")
     print(f"   Topic:  {TOPIC}")
     print(f"   Repo:   {os.getenv('GITHUB_REPO', '(not set)')}")
@@ -46,6 +111,9 @@ def main():
         return
     if not os.getenv("GITHUB_TOKEN"):
         print("⚠️  GITHUB_TOKEN not set. AI will analyze but cannot open PRs.")
+
+    # Start the HTTP server for build planning in a background thread
+    threading.Thread(target=start_planner_server, daemon=True).start()
 
     # Create the Kafka consumer
     # value_deserializer automatically parses JSON bytes into Python dicts
@@ -59,6 +127,10 @@ def main():
 
     print(f"👂 Listening on Kafka topic '{TOPIC}'...")
     print("   (waiting for failed builds...)\n")
+
+    # Start Prometheus metrics server on port 9101
+    start_http_server(9101)
+    print("📊 Metrics server listening on :9101")
 
     # Main consumer loop — runs forever
     for message in consumer:
@@ -131,6 +203,13 @@ def main():
             print(f"\n❌ Agent pipeline failed with error: {e}")
             import traceback
             traceback.print_exc()
+            AI_RUNS.labels(outcome="error").inc()
+        else:
+            # Record outcome metric
+            if final_state.get("pr_url"):
+                AI_RUNS.labels(outcome="pr_opened").inc()
+            else:
+                AI_RUNS.labels(outcome="no_pr").inc()
 
 
 if __name__ == "__main__":

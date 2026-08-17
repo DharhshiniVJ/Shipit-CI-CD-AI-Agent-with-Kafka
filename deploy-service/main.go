@@ -1,17 +1,20 @@
 package main
 
 import (
-	"os"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
-	kafka "github.com/segmentio/kafka-go"
 	_ "github.com/lib/pq"
+	kafka "github.com/segmentio/kafka-go"
 )
 
 // --------------------------------------------------------------------------------
@@ -117,6 +120,7 @@ func main() {
 
 	go consumeBuildResults(writer)
 	go consumeApprovals(writer)
+	go startMetricsServer()
 
 	// Block forever
 	select {}
@@ -167,6 +171,7 @@ func consumeBuildResults(writer *kafka.Writer) {
 
 		// Build succeeded — wait for QA approval!
 		log.Printf("⏸️  Build %s succeeded. Waiting for QA approval before deployment.\n", result.ID)
+		metricAwaitingApproval.Inc()
 	}
 }
 
@@ -215,24 +220,112 @@ func consumeApprovals(writer *kafka.Writer) {
 
 		// Publish the deployment result to Kafka for notify-service
 		publishDeployResult(writer, deployResult)
+
+		// Record metrics: deployment done, one fewer item in approval queue
+		metricDeploymentsTotal.WithLabelValues(deployResult.Status).Inc()
+		metricAwaitingApproval.Dec()
 	}
 }
 
-// runDeployment simulates deploying the application.
-// In a real system this would:
-//   - Pull the Docker image for the commit
-//   - Apply Kubernetes manifests (kubectl apply)
-//   - Wait for the rollout to complete
-//   - Run smoke tests against the new deployment
+// runDeployment pulls the image from the local daemon, creates k8s manifests, and deploys using kubectl.
 func runDeployment(pipelineID string) DeploymentResult {
-	log.Printf("ðŸš¢ Deploying pipeline %s to staging...\n", pipelineID)
-	time.Sleep(5 * time.Second) // simulate deployment work
+	log.Printf("🚢 Deploying pipeline %s to Kubernetes...\n", pipelineID)
+	
+	// Query repo and commit from database
+	var repo, commit string
+	err := db.QueryRow("SELECT repo, commit FROM pipeline_runs WHERE id = $1", pipelineID).Scan(&repo, &commit)
+	if err != nil {
+		log.Printf("❌ Failed to query pipeline run for deployment: %v\n", err)
+		return DeploymentResult{
+			PipelineID: pipelineID,
+			DeployID:   generateUUID(),
+			Status:     "failed",
+			Reason:     "Database error finding pipeline",
+			DeployedAt: time.Now(),
+		}
+	}
+
+	appName := strings.ReplaceAll(strings.ToLower(repo), "/", "-")
+	imageTag := fmt.Sprintf("shipit-%s:%s", appName, commit)
+
+	// Create temporary directory for k8s manifests
+	tmpDir, err := os.MkdirTemp("", "deploy-*")
+	if err != nil {
+		log.Printf("❌ Failed to create tmp dir for deployment: %v\n", err)
+		return DeploymentResult{
+			PipelineID: pipelineID,
+			DeployID:   generateUUID(),
+			Status:     "failed",
+			Reason:     "Filesystem error",
+			DeployedAt: time.Now(),
+		}
+	}
+	defer os.RemoveAll(tmpDir)
+
+	manifestYAML := fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+      - name: web
+        image: %s
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8081
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s-svc
+spec:
+  type: NodePort
+  selector:
+    app: %s
+  ports:
+  - port: 8081
+    targetPort: 8081
+    nodePort: 30081
+`, appName, appName, appName, imageTag, appName, appName)
+
+	manifestPath := filepath.Join(tmpDir, "deployment.yaml")
+	os.WriteFile(manifestPath, []byte(manifestYAML), 0644)
+
+	// Execute kubectl apply
+	// We pass the server explicitly because inside the container 127.0.0.1 is the container itself,
+	// but the kubeconfig mounted from Windows uses 127.0.0.1. kubernetes.docker.internal points to the host's K8s API.
+	cmd := exec.Command("kubectl", "apply", "-f", manifestPath, "--server=https://kubernetes.docker.internal:6443", "--insecure-skip-tls-verify=true")
+	cmd.Dir = tmpDir
+	output, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		log.Printf("❌ kubectl apply failed: %v\nOutput: %s\n", err, string(output))
+		return DeploymentResult{
+			PipelineID: pipelineID,
+			DeployID:   generateUUID(),
+			Status:     "failed",
+			Reason:     fmt.Sprintf("kubectl apply failed: %v", err),
+			DeployedAt: time.Now(),
+		}
+	}
+
+	log.Printf("✅ Deployment applied to Kubernetes for %s\n%s", repo, string(output))
 
 	return DeploymentResult{
 		PipelineID: pipelineID,
 		DeployID:   generateUUID(),
 		Status:     "deployed",
-		Reason:     "Deployment to staging successful",
+		Reason:     "Deployed to Kubernetes cluster",
 		DeployedAt: time.Now(),
 	}
 }

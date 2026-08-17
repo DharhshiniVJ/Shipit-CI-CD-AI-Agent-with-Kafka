@@ -9,10 +9,10 @@ An autonomous CI/CD platform that detects build failures, uses an AI agent to di
 ## Architecture
 
 ```
-Developer CLI
-     │
-     │  shipit trigger --repo owner/repo --commit abc123
-     ▼
+Developer CLI   GitHub Webhook (Push)
+     │                │
+     │  shipit trigger│
+     ▼                ▼
 ┌──────────────────┐   HTTP    ┌──────────────────┐
 │   shipit-cli     │ ────────▶ │ pipeline-service │──── PostgreSQL
 │   (Go CLI)       │           │   (Go HTTP :8080)│
@@ -27,16 +27,16 @@ Developer CLI
                                [build.completed]  ← Kafka topic
                           ┌─────────────┼─────────────┐
                           ▼             ▼             ▼
-               ┌──────────────┐  ┌───────────┐  ┌──────────────┐
-               │deploy-service│  │  notify-  │  │  ai-worker   │
-               │  (Go)        │  │  service  │  │  (Python)    │
-               └──────────────┘  │  (Go)     │  │  LangGraph   │
-                                 └───────────┘  └──────┬───────┘
-                                                        │
-                                               Inspector → Analyst
-                                               → Fixer  → Critic
-                                                        │
-                                                  GitHub PR ✅
+  (Waits for /approve) ┌──────────────┐  ┌───────────┐  ┌──────────────┐
+   then deploys via    │deploy-service│  │  notify-  │  │  ai-worker   │
+   kubectl             │  (Go)        │  │  service  │  │  (Python)    │
+                       └──────────────┘  │  (Go)     │  │  LangGraph   │
+                                         └───────────┘  └──────┬───────┘
+                                                                │
+                                                       Inspector → Analyst
+                                                       → Fixer  → Critic
+                                                                │
+                                                          GitHub PR ✅
 ```
 
 ---
@@ -209,14 +209,20 @@ Opens PR ──────────────────────▶ R
                                  Merge  ← only you can do this
 ```
 
+Furthermore, the deployment pipeline includes a **QA Approval Gate**:
+1. When a build succeeds, it does not deploy automatically.
+2. `pipeline-service` opens a GitHub Issue asking for deploy approval.
+3. A developer must comment `/approve` on the issue.
+4. Only then does `deploy-service` deploy the code to Kubernetes.
+
 ---
 
 ## Roadmap
 
-- [ ] QA approval gate — manual hold before deploy proceeds
-- [ ] GitHub Actions — lint, test, build/push Docker images
-- [ ] Prometheus + Grafana — metrics and dashboards
-- [ ] Kubernetes — K8s manifests for all services
+- [x] QA approval gate — manual hold before deploy proceeds (via GitHub Issues `/approve`)
+- [x] GitHub Actions — lint, test, build/push Docker images
+- [x] Prometheus + Grafana — metrics and dashboards
+- [x] Kubernetes — K8s manifests for all services
 - [ ] OpenTelemetry — distributed tracing across the full pipeline
 
 ---

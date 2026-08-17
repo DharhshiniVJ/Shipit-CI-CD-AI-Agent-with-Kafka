@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql" // Go's built-in database abstraction layer
@@ -15,7 +16,7 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 
 	// lib/pq is the PostgreSQL driver. We import it with a blank identifier (_)
-	// because we never call it directly â€” it registers itself with database/sql
+	// because we never call it directly — it registers itself with database/sql
 	// under the hood via an init() function. This is a common Go pattern.
 	_ "github.com/lib/pq"
 )
@@ -180,19 +181,66 @@ func main() {
 	// Step 3: Start the Kafka consumer in the background.
 	go consumeBuildResults()
 
-	// Step 4: Register HTTP routes and start the server.
+	// Step 4: Start the Prometheus metrics server on :9100 in the background.
+	go startMetricsServer()
+
+	// Step 5: Register HTTP routes and start the main server.
 	http.HandleFunc("/trigger", triggerHandler)
 	http.HandleFunc("/status/", statusHandler)
 	http.HandleFunc("/approve/", approveHandler)
 	http.HandleFunc("/approvals", listApprovalsHandler)
+	http.HandleFunc("/webhook", webhookHandler) // GitHub push events
 
 	fmt.Println("🚀 Starting pipeline-service on http://localhost:8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+
 // --------------------------------------------------------------------------------
 //  HTTP HANDLERS
 // --------------------------------------------------------------------------------
+
+// createAndTriggerPipeline is the shared logic used by both POST /trigger
+// and the GitHub webhook handler. It inserts a pipeline run into Postgres
+// and publishes the Kafka event to kick off the build.
+func createAndTriggerPipeline(repo, commit string) (PipelineRun, error) {
+	run := PipelineRun{
+		ID:        generateUUID(),
+		Repo:      repo,
+		Commit:    commit,
+		Status:    "pending",
+		CreatedAt: time.Now(),
+	}
+
+	insertSQL := `
+		INSERT INTO pipeline_runs (id, repo, commit, status, created_at)
+		VALUES ($1, $2, $3, $4, $5)`
+
+	_, err := db.Exec(insertSQL, run.ID, run.Repo, run.Commit, run.Status, run.CreatedAt)
+	if err != nil {
+		return PipelineRun{}, err
+	}
+
+	log.Printf("▶️  Pipeline %s triggered | repo: %s | commit: %.8s\n", run.ID, run.Repo, run.Commit)
+	metricPipelinesTriggered.WithLabelValues(run.Repo).Inc()
+
+	event := BuildEvent{ID: run.ID, Repo: run.Repo, Commit: run.Commit}
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		return run, err
+	}
+
+	if err := kafkaWriter.WriteMessages(context.Background(), kafka.Message{
+		Key:   []byte(run.ID),
+		Value: eventBytes,
+	}); err != nil {
+		log.Printf("❌ Failed to publish to Kafka: %v\n", err)
+	} else {
+		log.Printf("📧 Published event to Kafka topic '%s'\n", topicTriggered)
+	}
+
+	return run, nil
+}
 
 // triggerHandler handles POST /trigger.
 // Creates a pipeline run in PostgreSQL and publishes a Kafka event.
@@ -208,56 +256,18 @@ func triggerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run := PipelineRun{
-		ID:        generateUUID(),
-		Repo:      req.Repo,
-		Commit:    req.Commit,
-		Status:    "pending",
-		CreatedAt: time.Now(),
-	}
-
-	// -------------------------------------------------------------------------------- INSERT into PostgreSQL --------------------------------------------------------------------------------
-	// $1, $2, $3... are positional placeholders — PostgreSQL's way of safely
-	// injecting values. This prevents SQL injection attacks.
-	// Never use fmt.Sprintf to build SQL strings!
-	insertSQL := `
-		INSERT INTO pipeline_runs (id, repo, commit, status, created_at)
-		VALUES ($1, $2, $3, $4, $5)`
-
-	_, err := db.Exec(insertSQL, run.ID, run.Repo, run.Commit, run.Status, run.CreatedAt)
+	run, err := createAndTriggerPipeline(req.Repo, req.Commit)
 	if err != nil {
-		log.Printf("❌ Failed to insert pipeline run: %v\n", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	// --------------------------------------------------------------------------------
-
-	log.Printf("▶️   Pipeline %s triggered | repo: %s | commit: %s\n", run.ID, run.Repo, run.Commit)
-
-	// -------------------------------------------------------------------------------- Publish to Kafka --------------------------------------------------------------------------------
-	event := BuildEvent{ID: run.ID, Repo: run.Repo, Commit: run.Commit}
-	eventBytes, err := json.Marshal(event)
-	if err != nil {
-		log.Printf("❌ Failed to marshal Kafka event: %v\n", err)
+		log.Printf("❌ Failed to trigger pipeline: %v\n", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-
-	err = kafkaWriter.WriteMessages(context.Background(), kafka.Message{
-		Key:   []byte(run.ID),
-		Value: eventBytes,
-	})
-	if err != nil {
-		log.Printf("❌ Failed to publish to Kafka: %v\n", err)
-	} else {
-		log.Printf("📧 Published event to Kafka topic '%s'\n", topicTriggered)
-	}
-	// --------------------------------------------------------------------------------
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(run)
 }
+
 
 // statusHandler handles GET /status/{id}.
 // Fetches the pipeline run directly from PostgreSQL.
@@ -304,6 +314,39 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(run)
 }
 
+// approvePipeline updates the DB and publishes to Kafka.
+func approvePipeline(id string, user string) error {
+	updateSQL := `
+		UPDATE approvals 
+		SET status = 'approved', approved_by = $1, approved_at = $2 
+		WHERE pipeline_id = $3 AND status = 'pending'
+		RETURNING pipeline_id`
+	
+	var returnedID string
+	err := db.QueryRow(updateSQL, user, time.Now(), id).Scan(&returnedID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("pipeline not found or not pending approval")
+	} else if err != nil {
+		return fmt.Errorf("database error: %v", err)
+	}
+
+	// Publish to Kafka
+	event := ApprovalEvent{PipelineID: id, ApprovedBy: user}
+	eventBytes, _ := json.Marshal(event)
+	
+	err = kafkaApprovalWriter.WriteMessages(context.Background(), kafka.Message{
+		Key:   []byte(id),
+		Value: eventBytes,
+	})
+	if err != nil {
+		log.Printf("❌ Failed to publish approval to Kafka: %v\n", err)
+		return err
+	}
+	
+	log.Printf("📫 Published approval for pipeline %s to Kafka\n", id)
+	return nil
+}
+
 // approveHandler handles POST /approve/{id}.
 // Marks a pipeline as approved and publishes an approval event.
 func approveHandler(w http.ResponseWriter, r *http.Request) {
@@ -318,35 +361,11 @@ func approveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updateSQL := `
-		UPDATE approvals 
-		SET status = 'approved', approved_by = 'qa-team', approved_at = $1 
-		WHERE pipeline_id = $2 AND status = 'pending'
-		RETURNING pipeline_id`
-	
-	var returnedID string
-	err := db.QueryRow(updateSQL, time.Now(), id).Scan(&returnedID)
-	if err == sql.ErrNoRows {
-		http.Error(w, "Pipeline not found or not pending approval", http.StatusNotFound)
-		return
-	} else if err != nil {
-		log.Printf("❌ Failed to update approval: %v\n", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	// Publish to Kafka
-	event := ApprovalEvent{PipelineID: id, ApprovedBy: "qa-team"}
-	eventBytes, _ := json.Marshal(event)
-	
-	err = kafkaApprovalWriter.WriteMessages(context.Background(), kafka.Message{
-		Key:   []byte(id),
-		Value: eventBytes,
-	})
+	err := approvePipeline(id, "qa-team")
 	if err != nil {
-		log.Printf("❌ Failed to publish approval to Kafka: %v\n", err)
-	} else {
-		log.Printf("📫 Published approval for pipeline %s to Kafka\n", id)
+		log.Printf("❌ Failed to update approval: %v\n", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -446,8 +465,48 @@ func consumeBuildResults() {
 				log.Printf("❌ Failed to insert into approvals: %v\n", err)
 			} else {
 				log.Printf("⏸️  Pipeline %s is awaiting deployment approval\n", result.ID)
+				
+				// Open GitHub Issue for approval
+				var repo, commit string
+				err := db.QueryRow("SELECT repo, commit FROM pipeline_runs WHERE id = $1", result.ID).Scan(&repo, &commit)
+				if err == nil {
+					createGitHubIssue(repo, commit, result.ID)
+				}
 			}
 		}
+	}
+}
+
+// --------------------------------------------------------------------------------
+//  GITHUB API HELPERS
+// --------------------------------------------------------------------------------
+
+func createGitHubIssue(repo, commit, pipelineID string) {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		log.Println("⚠️  GITHUB_TOKEN not set, skipping issue creation")
+		return
+	}
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/issues", repo)
+	body := map[string]string{
+		"title": fmt.Sprintf("🚀 Deploy approval needed: %s@%.8s", repo, commit),
+		"body": fmt.Sprintf("Pipeline `%s` has successfully built commit `%s`.\n\nReply with `/approve` to trigger deployment.\n\n<!-- pipeline: %s -->", pipelineID, commit, pipelineID),
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode >= 300 {
+		log.Printf("❌ Failed to create GitHub issue: %v", err)
+	} else {
+		log.Printf("📝 GitHub approval issue opened for pipeline %s", pipelineID)
+	}
+	if resp != nil {
+		resp.Body.Close()
 	}
 }
 

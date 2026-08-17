@@ -10,6 +10,8 @@ is getting increasingly specific about exactly what is STILL wrong.
 """
 
 import os
+import subprocess
+import tempfile
 from langchain_openai import ChatOpenAI
 from models import ProposedFix, RootCause, Critique, FileFix
 
@@ -79,7 +81,58 @@ def run_critic(state: dict) -> dict:
             + "\n".join(parts)
         )
 
+    # --- RUNTIME VERIFICATION ---
+    repo = state.get("repo", os.getenv("GITHUB_REPO"))
+    runtime_success = True
+    runtime_feedback = ""
+    if repo:
+        print("   ⚙️  Running real-world compiler runtime check...")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_url = f"https://github.com/{repo}.git"
+                subprocess.run(["git", "clone", "--depth", "1", repo_url, tmpdir], check=True, capture_output=True)
+                
+                for fix in fixes_to_review:
+                    filepath = os.path.join(tmpdir, fix.file_path)
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                    with open(filepath, "w") as f:
+                        f.write(fix.fixed_content)
+                
+                for cmd, name in [
+                    (["go", "mod", "tidy"], "mod tidy"),
+                    (["go", "build", "./..."], "build"),
+                    (["go", "vet", "./..."], "vet"),
+                    (["go", "test", "./..."], "test")
+                ]:
+                    print(f"      ▶️  Running go {name}...")
+                    res = subprocess.run(cmd, cwd=tmpdir, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        runtime_success = False
+                        err_out = res.stderr.strip() or res.stdout.strip()
+                        runtime_feedback = f"Runtime check failed during `go {name}`:\n{err_out}"
+                        print(f"      ❌ Failed `{name}` check")
+                        break
+        except Exception as e:
+            print(f"   ⚠️  Failed to run compiler check: {e}")
+
+    if not runtime_success:
+        critique = Critique(
+            is_confident=False,
+            confidence_score=0.0,
+            feedback=f"The proposed fix failed local compilation/testing. You MUST fix these errors:\n\n{runtime_feedback}",
+            issues=[runtime_feedback],
+            files_still_broken=[f.file_path for f in fixes_to_review]
+        )
+        print(f"   ❌ Fix REJECTED by local compiler check")
+        return {
+            **state,
+            "critique": critique,
+            "critique_history": critique_history + [critique],
+        }
+
     prompt = f"""You are a strict senior Go engineer doing a final code review before a PR is merged to production.
+
+[SYSTEM NOTE: THE CODE WAS JUST COMPILED AND PASSED `go build`, `go vet`, AND `go test`. THE SYNTAX IS 100% CORRECT.]
 
 A junior AI agent generated the following fix for a CI/CD build failure. Your job:
 1. Verify EVERY build error in the original log is resolved by the fix

@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s      # How often to collect metrics
+  evaluation_interval: 15s  # How often to evaluate alerting rules
+
+scrape_configs:
+  - job_name: "pipeline-service"
+    static_configs:
+      - targets: ["pipeline-service:9100"]
+
+  - job_name: "build-service"
+    static_configs:
+      - targets: ["build-service:9100"]
+
+  - job_name: "deploy-service"
+    static_configs:
+      - targets: ["deploy-service:9100"]
+
+  - job_name: "notify-service"
+    static_configs:
+      - targets: ["notify-service:9100"]
+
+  - job_name: "ai-worker"
+    static_configs:
+      - targets: ["ai-worker:9101"]

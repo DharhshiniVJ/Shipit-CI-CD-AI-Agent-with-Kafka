@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	kafka "github.com/segmentio/kafka-go"
@@ -17,7 +21,6 @@ import (
 // --------------------------------------------------------------------------------
 
 // BuildEvent is the Kafka message we RECEIVE from pipeline-service.
-// It tells us which pipeline to build and for which repo/commit.
 type BuildEvent struct {
 	ID     string `json:"id"`
 	Repo   string `json:"repo"`
@@ -25,12 +28,11 @@ type BuildEvent struct {
 }
 
 // BuildResult is the Kafka message we PUBLISH back to pipeline-service.
-// It carries the final outcome of the build.
-// BuildLog is populated only on failure â€” the AI worker uses it to diagnose the issue.
+// BuildLog is populated on failure — the AI worker uses it to diagnose the issue.
 type BuildResult struct {
 	ID       string `json:"id"`
 	Status   string `json:"status"`   // "success" or "failed"
-	BuildLog string `json:"build_log"` // raw build output â€” empty on success
+	BuildLog string `json:"build_log"` // real compiler output — empty on success
 	Repo     string `json:"repo"`
 	Commit   string `json:"commit"`
 }
@@ -51,26 +53,18 @@ const (
 // --------------------------------------------------------------------------------
 
 func main() {
-	fmt.Println("ðŸ”¨ Starting build-service...")
+	fmt.Println("🔨 Starting build-service...")
 
-	// -------------------------------------------------------------------------------- Kafka Consumer (Reader) --------------------------------------------------------------------------------
-	// This reads incoming build jobs from the "pipeline.triggered" topic.
-	// GroupID "build-service-group" means Kafka tracks our read position â€”
-	// if this service restarts, it won't re-process already-handled messages.
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{kafkaBroker},
-		Topic:   topicTriggered,
-		GroupID: "build-service-group",
+		Brokers:     []string{kafkaBroker},
+		Topic:       topicTriggered,
+		GroupID:     "build-service-group",
 		StartOffset: kafka.FirstOffset,
-		// MinBytes and MaxBytes control how much data to fetch per request.
-		// These are sensible defaults for low-latency development.
-		MinBytes: 1,
-		MaxBytes: 10e6, // 10 MB
+		MinBytes:    1,
+		MaxBytes:    10e6, // 10 MB
 	})
 	defer reader.Close()
 
-	// -------------------------------------------------------------------------------- Kafka Producer (Writer) --------------------------------------------------------------------------------
-	// This publishes build results back to pipeline-service via "build.completed".
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaBroker),
 		Topic:    topicBuildCompleted,
@@ -78,37 +72,32 @@ func main() {
 	}
 	defer writer.Close()
 
-	log.Printf("ðŸ‘‚ Listening on Kafka topic '%s'...\n", topicTriggered)
+	log.Printf("👂 Listening on Kafka topic '%s'...\n", topicTriggered)
 
-	// -------------------------------------------------------------------------------- Main Event Loop --------------------------------------------------------------------------------
-	// This runs forever. Each iteration processes one build job.
-	//
-	// Go Idiom: `for {}` without a condition is an infinite loop.
-	// This is the standard pattern for long-running consumer services.
+	// Start Prometheus metrics server in background
+	go startMetricsServer()
+
+	// Main event loop — runs forever.
 	for {
-		// ReadMessage blocks (waits) until a new message arrives.
-		// When pipeline-service triggers a build, it lands here.
 		msg, err := reader.ReadMessage(context.Background())
 		if err != nil {
-			log.Printf("âŒ Error reading from Kafka: %v\n", err)
+			log.Printf("❌ Error reading from Kafka: %v\n", err)
 			continue
 		}
 
-		// Decode the JSON message into a BuildEvent struct
 		var event BuildEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			log.Printf("âŒ Failed to parse build event: %v\n", err)
+			log.Printf("❌ Failed to parse build event: %v\n", err)
 			continue
 		}
 
-		log.Printf("ðŸ“¥ Received build job | pipeline: %s | repo: %s | commit: %s\n",
+		log.Printf("📥 Received build job | pipeline: %s | repo: %s | commit: %s\n",
 			event.ID, event.Repo, event.Commit)
 
-		// Run the (simulated) build. Now returns both status and a log.
+		start := time.Now()
 		finalStatus, buildLog := runBuild(event)
+		duration := time.Since(start)
 
-		// Publish the result back to Kafka so pipeline-service can update its store.
-		// BuildLog is included so the ai-worker can analyze it on failure.
 		result := BuildResult{
 			ID:       event.ID,
 			Status:   finalStatus,
@@ -118,7 +107,7 @@ func main() {
 		}
 		resultBytes, err := json.Marshal(result)
 		if err != nil {
-			log.Printf("âŒ Failed to marshal build result: %v\n", err)
+			log.Printf("❌ Failed to marshal build result: %v\n", err)
 			continue
 		}
 
@@ -127,59 +116,253 @@ func main() {
 			Value: resultBytes,
 		})
 		if err != nil {
-			log.Printf("âŒ Failed to publish result to Kafka: %v\n", err)
+			log.Printf("❌ Failed to publish result to Kafka: %v\n", err)
 		} else {
-			icon := "âœ…"
+			icon := "✅"
 			if finalStatus == "failed" {
-				icon = "âŒ"
+				icon = "❌"
 			}
-			log.Printf("%s Published build result for pipeline %s: %s\n", icon, event.ID, finalStatus)
+			log.Printf("%s Build finished for pipeline %s: %s (took %s)\n",
+				icon, event.ID, finalStatus, duration.Round(time.Second))
 		}
+
+		// Record Prometheus metrics
+		observeBuild(finalStatus, duration)
 	}
 }
 
-
 // --------------------------------------------------------------------------------
-//  BUILD SIMULATION
+//  REAL BUILD RUNNER
 // --------------------------------------------------------------------------------
 
-// runBuild simulates the actual build process for a given pipeline event.
-// Returns the final status AND a build log (populated only on failure).
+// runBuild clones the repo, checks out the exact commit, detects the language,
+// and runs the real build command. Returns ("success","") or ("failed","<log>").
 func runBuild(event BuildEvent) (string, string) {
-	log.Printf("ðŸ”§ Building pipeline %s (repo: %s, commit: %s)...\n",
+	log.Printf("🔧 Starting real build | pipeline: %s | repo: %s | commit: %s\n",
 		event.ID, event.Repo, event.Commit)
 
-	// Simulate build work taking 10 seconds
-	time.Sleep(10 * time.Second)
-
-	// Randomly decide success or failure using crypto/rand
-	b := make([]byte, 1)
-	rand.Read(b)
-
-	if b[0]%2 == 0 {
-		return "failed", generateFakeFailureLog(event)
+	// Step 1: Create a temporary working directory.
+	// os.MkdirTemp creates a unique directory and cleans it up when we call
+	// os.RemoveAll — this ensures no disk leaks between builds.
+	tmpDir, err := os.MkdirTemp("", "shipit-build-*")
+	if err != nil {
+		msg := fmt.Sprintf("[shipit] Failed to create temp directory: %v", err)
+		log.Println(msg)
+		return "failed", msg
 	}
+	defer os.RemoveAll(tmpDir) // Always clean up, even if build fails
+
+	// Step 2: Clone the repository.
+	// We embed the token in the URL so git doesn't prompt for credentials.
+	// Format: https://<token>@github.com/<owner>/<repo>.git
+	token := os.Getenv("GITHUB_TOKEN")
+	var cloneURL string
+	if token != "" {
+		cloneURL = fmt.Sprintf("https://%s@github.com/%s.git", token, event.Repo)
+	} else {
+		// Fall back to unauthenticated clone for public repos
+		cloneURL = fmt.Sprintf("https://github.com/%s.git", event.Repo)
+	}
+
+	log.Printf("📦 Cloning %s...\n", event.Repo)
+	cloneOut, err := runCmd(tmpDir, "git", "clone", "--quiet", cloneURL, ".")
+	if err != nil {
+		buildLog := fmt.Sprintf("[shipit] git clone failed\n\n%s\n%s", cloneOut, err)
+		log.Printf("❌ Clone failed: %v\n", err)
+		return "failed", buildLog
+	}
+
+	// Step 3: Check out the exact commit SHA.
+	// This is critical — we must build the exact code that was pushed,
+	// not just "whatever is on main right now".
+	log.Printf("🔀 Checking out commit %s...\n", event.Commit)
+	checkoutOut, err := runCmd(tmpDir, "git", "checkout", event.Commit)
+	if err != nil {
+		buildLog := fmt.Sprintf("[shipit] git checkout %s failed\n\n%s\n%s",
+			event.Commit, checkoutOut, err)
+		log.Printf("❌ Checkout failed: %v\n", err)
+		return "failed", buildLog
+	}
+
+	// Step 4: Auto-detect the build language by looking for marker files.
+	lang, buildCmd := detectLanguage(tmpDir)
+	log.Printf("🔍 Detected language: %s | command: %s\n", lang, strings.Join(buildCmd, " "))
+
+	// Step 5: Run the real build command and capture its output.
+	log.Printf("🏗️  Running build: %s\n", strings.Join(buildCmd, " "))
+	buildOutput, err := runCmd(tmpDir, buildCmd[0], buildCmd[1:]...)
+
+	// Always show the build output in our own logs, even on success
+	if buildOutput != "" {
+		for _, line := range strings.Split(strings.TrimSpace(buildOutput), "\n") {
+			log.Printf("  [build] %s\n", line)
+		}
+	}
+
+	if err != nil {
+		// Build failed — include the real compiler output in the result
+		// so the AI worker has something concrete to analyze
+		buildLog := fmt.Sprintf(
+			"[shipit] Build failed for %s @ %s\n[shipit] Language: %s\n[shipit] Command: %s\n\n%s",
+			event.Repo, event.Commit, lang, strings.Join(buildCmd, " "), buildOutput,
+		)
+		return "failed", buildLog
+	}
+
+	// Step 6: Build the Docker image for Kubernetes deployment
+	log.Println("🐳 Building Docker image...")
+	
+	// If there's no Dockerfile, generate a simple one for Go apps
+	dockerfilePath := filepath.Join(tmpDir, "Dockerfile")
+	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
+		log.Println("⚠️  No Dockerfile found. Generating a default Go Dockerfile.")
+		defaultDockerfile := `FROM golang:1.23-alpine
+WORKDIR /app
+COPY . .
+RUN go build -o main .
+CMD ["./main"]
+`
+		os.WriteFile(dockerfilePath, []byte(defaultDockerfile), 0644)
+	}
+
+	imageTag := fmt.Sprintf("shipit-%s:%s", strings.ReplaceAll(strings.ToLower(event.Repo), "/", "-"), event.Commit)
+	
+	dockerOut, err := runCmd(tmpDir, "docker", "build", "-t", imageTag, ".")
+	if err != nil {
+		buildLog := fmt.Sprintf("[shipit] Docker build failed for %s @ %s\n\n%s\n%s", event.Repo, event.Commit, dockerOut, err)
+		log.Printf("❌ Docker build failed: %v\nOutput: %s\n", err, dockerOut)
+		return "failed", buildLog
+	}
+
+	log.Printf("✅ Docker image built: %s\n", imageTag)
+
 	return "success", ""
 }
 
-// generateFakeFailureLog produces a realistic-looking Go build error log.
-// In a real system this would be captured stdout/stderr from `go build`.
-// The AI agents use this log to understand what went wrong and generate a fix.
-func generateFakeFailureLog(event BuildEvent) string {
-	return fmt.Sprintf(`[shipit-build] Starting build for %s @ %s
-[shipit-build] Cloning repository...
-[shipit-build] Running: go build ./...
+// AIBuildRequest is sent to the ai-worker
+type AIBuildRequest struct {
+	FileTree     []string          `json:"file_tree"`
+	FileContents map[string]string `json:"file_contents"`
+}
 
-# %s
-./handler.go:31:16: undefined: handleReqest
-./handler.go:31:16: (did you mean handleRequest--------------------------------------------------------------------------------)
-./config.go:14:2: imported and not used: "os"
-note: module requires Go >= 1.20
+// AIBuildResponse is received from the ai-worker
+type AIBuildResponse struct {
+	Language     string `json:"language"`
+	BuildCommand string `json:"build_command"`
+	TestCommand  string `json:"test_command"`
+	RuntimeImage string `json:"runtime_image"`
+	Confidence   string `json:"confidence"`
+	Reasoning    string `json:"reasoning"`
+	Error        string `json:"error"`
+}
 
-FAIL\t%s [build failed]
-exit status 2
+// detectLanguage asks the AI build planner for the exact build command.
+// If the AI fails or returns low confidence, it falls back to basic file detection.
+func detectLanguage(dir string) (string, []string) {
+	log.Println("🧠 Asking AI build planner for configuration...")
 
-[shipit-build] Build failed after 8.3s`, event.Repo, event.Commit, event.Repo, event.Repo)
+	// 1. Gather file tree (top level only)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("⚠️ Failed to read directory, using fallback: %v", err)
+		return fallbackDetectLanguage(dir)
+	}
+
+	var tree []string
+	contents := make(map[string]string)
+	keyFiles := []string{
+		"go.mod", "package.json", "requirements.txt", "Makefile",
+		"Dockerfile", ".shipit.yml", "Cargo.toml", "pom.xml", "build.gradle",
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			tree = append(tree, e.Name())
+			
+			// If it's a key file, read its contents
+			for _, kf := range keyFiles {
+				if e.Name() == kf {
+					b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+					if err == nil {
+						contents[e.Name()] = string(b)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// 2. Call the AI Build Planner API
+	reqBody, _ := json.Marshal(AIBuildRequest{
+		FileTree:     tree,
+		FileContents: contents,
+	})
+
+	// The ai-worker container is accessible at http://ai-worker:8000
+	resp, err := http.Post("http://ai-worker:8000/analyze-build", "application/json", bytes.NewBuffer(reqBody))
+	if err == nil {
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == 200 {
+			var aiResp AIBuildResponse
+			if err := json.NewDecoder(resp.Body).Decode(&aiResp); err == nil && aiResp.Error == "" {
+				log.Printf("🤖 AI says: %s (confidence: %s) - %s", aiResp.Language, aiResp.Confidence, aiResp.Reasoning)
+				if aiResp.BuildCommand != "" {
+					// Split command string into args ("go build ./..." -> ["go", "build", "./..."])
+					// Note: a real shell parser would be better here, but this is fine for basic commands
+					return aiResp.Language, strings.Fields(aiResp.BuildCommand)
+				}
+			}
+		}
+	}
+	
+	log.Println("⚠️ AI planner failed or returned invalid response, falling back to basic detection.")
+	return fallbackDetectLanguage(dir)
+}
+
+// fallbackDetectLanguage checks for well-known project marker files
+func fallbackDetectLanguage(dir string) (string, []string) {
+	// Check in priority order: Go → Node → Python → Make
+	checks := []struct {
+		marker  string
+		lang    string
+		command []string
+	}{
+		{"go.mod", "Go", []string{"go", "build", "./..."}},
+		{"package.json", "Node.js", []string{"npm", "ci"}},
+		{"requirements.txt", "Python", []string{"pip", "install", "-r", "requirements.txt"}},
+		{"Makefile", "Make", []string{"make", "build"}},
+	}
+
+	for _, c := range checks {
+		if _, err := os.Stat(filepath.Join(dir, c.marker)); err == nil {
+			return c.lang, c.command
+		}
+	}
+
+	// Nothing recognized — fail with a helpful message
+	return "unknown", []string{
+		"sh", "-c",
+		"echo 'No supported build file found (go.mod, package.json, requirements.txt, Makefile)' && exit 1",
+	}
+}
+
+// runCmd runs an external command in the given working directory,
+// captures stdout+stderr combined, and returns them along with any error.
+// This is a thin wrapper around os/exec to keep the build logic readable.
+func runCmd(dir string, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+
+	// Combine stdout and stderr into one buffer.
+	// Real compilers mix both streams in their output (e.g. `go build`
+	// prints errors to stderr but progress to stdout).
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err := cmd.Run()
+	return out.String(), err
 }
 
 func getEnv(key, fallback string) string {
@@ -188,7 +371,3 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
-
-
-

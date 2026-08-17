@@ -41,6 +41,7 @@ services:
       context: ./pipeline-service
     ports:
       - "8080:8080"
+      - "9100:9100"   # Prometheus metrics
     depends_on:
       - kafka
       - postgres
@@ -50,11 +51,15 @@ services:
       - DB_USER=shipit
       - DB_PASSWORD=shipit
       - DB_NAME=pipeline_db
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}  # GitHub webhook secret
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
     restart: on-failure
 
   build-service:
     build:
       context: ./build-service
+    ports:
+      - "9101:9100"   # Prometheus metrics (host:container)
     depends_on:
       - kafka
       - postgres
@@ -64,11 +69,21 @@ services:
       - DB_USER=shipit
       - DB_PASSWORD=shipit
       - DB_NAME=pipeline_db
+      - GITHUB_TOKEN=${GITHUB_TOKEN}   # for cloning repos
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - type: bind
+        source: //var/run/docker.sock
+        target: /var/run/docker.sock
     restart: on-failure
 
   deploy-service:
     build:
       context: ./deploy-service
+    ports:
+      - "9102:9100"   # Prometheus metrics (host:container)
+    volumes:
+      - ~/.kube:/root/.kube:ro
     depends_on:
       - kafka
       - postgres
@@ -83,6 +98,8 @@ services:
   notify-service:
     build:
       context: ./notify-service
+    ports:
+      - "9103:9100"   # Prometheus metrics (host:container)
     depends_on:
       - kafka
     environment:
@@ -93,6 +110,8 @@ services:
   ai-worker:
     build:
       context: ./ai-worker
+    ports:
+      - "9104:9101"   # Prometheus metrics (host:container)
     depends_on:
       - kafka
     env_file:
@@ -101,6 +120,39 @@ services:
       - KAFKA_BROKER=kafka:29092
     restart: on-failure
 
-# Declare the named volume at the top level so Docker manages it.
+  # ── Monitoring ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: shipit-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    restart: on-failure
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: shipit-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=shipit
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: on-failure
+
+# Named volumes — data persists across container restarts.
 volumes:
   postgres_data:
+  grafana_data:
